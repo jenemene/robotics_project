@@ -6,7 +6,7 @@ from rclpy.node import Node
 from std_msgs.msg import String
 
 PORT = '/dev/ttyACM0'
-BAUD = 9600   # must match Serial.begin(...) in the sketch
+BAUD = 115200   # must match Serial.begin(...) in the sketch
 
 
 class ArduinoBridge(Node):

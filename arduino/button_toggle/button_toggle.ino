@@ -7,7 +7,7 @@ unsigned long lastChange = 0;
 void setup() {
   pinMode(BTN, INPUT_PULLUP);
   pinMode(LED, OUTPUT);
-  Serial.begin(9600);
+  Serial.begin(115200);
 }
 
 void loop() {
