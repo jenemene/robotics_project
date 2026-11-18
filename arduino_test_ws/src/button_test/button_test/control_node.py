@@ -1,18 +1,20 @@
-import math
+import time
 
 import rclpy
-from geometry_msgs.msg import PoseStamped
+import rtde_control
 from rclpy.node import Node
 from std_msgs.msg import String
 
-# Pick-and-place sequence with plain URScript (no MoveIt).
-# Needs the pendant in REMOTE mode. No External Control program needed.
-# The robot does the inverse kinematics itself.
+# Pick and place with ur_rtde (no UR ROS driver, no MoveIt).
+# LOCAL mode: the External Control program must be running on the pendant,
+# with Host IP = this PC (127.0.0.1 for URSim) and port 50002.
+# Do NOT run ur_robot_driver at the same time.
+
+ROBOT_IP = '192.168.50.17'   # URSim. On the real robot: the robot's IP from the pendant
 
 # Poses as shown on the pendant (feature = Base): [x, y, z, rx, ry, rz]
 #   x, y, z    in metres (pendant shows mm)
 #   rx, ry, rz rotation vector in radians
-# The poses are for the TCP that is active on the pendant.
 POSES = {
     'pick':  [0.636, 0.409, 0.008, -3.14, 0.0, 0.0],
     'place': [0.572, 0.500, 0.035, -3.14, 14 * 3.14 / 180, 4 * 3.14 / 180],
@@ -27,10 +29,10 @@ def above(name, dz=0.20):
     return p
 
 
-# The sequence: (move type, target). Edit this list to change what the robot does.
-#   'movej' : joints move together, fast, path is not a straight line
+# The pick-and-place sequence. Each step is (action, target).
+#   'movej' : joints move together, fast, path not straight (robot does the inverse kinematics)
 #   'movel' : straight line
-#   'grip'  : gripper placeholder (just waits GRIP_TIME for now)
+#   'grip'  : gripper placeholder (just waits 1 second for now)
 SEQUENCE = [
     ('movej', POSES['home']),
     ('movej', above('pick')),     # fast move to above pick
@@ -44,83 +46,74 @@ SEQUENCE = [
     ('movej', POSES['home']),
 ]
 
-RUN_ALL = False      # True: one button press = whole sequence. False: one press = one step
+LIN_SPEED = 0.05     # movel: m/s
+LIN_ACCEL = 0.3      # movel: m/s^2
+JOINT_SPEED = 0.3    # movej: rad/s
+JOINT_ACCEL = 0.5    # movej: rad/s^2
 
-LIN_ACCEL = 0.3     # movel: m/s^2
-LIN_SPEED = 0.05    # movel: m/s
-JOINT_ACCEL = 0.5   # movej: rad/s^2 (movej speeds are JOINT speeds, not tool speeds)
-JOINT_SPEED = 0.3   # movej: rad/s
-TOLERANCE = 0.002   # metres, how close counts as "arrived"
-GRIP_TIME = 1.0     # seconds the placeholder gripper "takes"
+RUN_ALL = True       # True: one button press = whole sequence. False: one press = one step
 
 
 class ControlNode(Node):
     def __init__(self):
         super().__init__('control_node')
-        self.step = 0          # which step of SEQUENCE is next
-        self.target = None     # (x, y, z) of the move in progress, or None
+        self.step = 0   # which step of SEQUENCE is next
 
-        # publishers
-        self.script_pub = self.create_publisher(
-            String, '/urscript_interface/script_command', 10)   # URScript to the robot
-        self.tx_pub = self.create_publisher(String, '/arduino/tx', 10)   # LED on/off
+        # connect to the robot through the External Control URCap
+        self.get_logger().info(f'Connecting to robot at {ROBOT_IP}... (press Play on the pendant if this hangs)')
+        flags = (rtde_control.RTDEControlInterface.FLAG_USE_EXT_UR_CAP              # run via External Control (Local mode)
+                 | rtde_control.RTDEControlInterface.FLAG_DISABLE_REMOTE_CONTROL_CHECK  # don't ask dashboard (port 29999)
+                 | rtde_control.RTDEControlInterface.FLAG_VERBOSE)                     # print what ur_rtde is doing
+        self.robot = rtde_control.RTDEControlInterface(ROBOT_IP, 500.0, flags, 50002)
+        self.get_logger().info('Connected.')
 
-        # subscribers
-        self.create_subscription(String, '/arduino/rx', self.on_arduino, 10)   # button
-        self.create_subscription(
-            PoseStamped, '/tcp_pose_broadcaster/pose', self.on_pose, 10)   # where the TCP is
+        self.tx_pub = self.create_publisher(String, '/arduino/tx', 10)          # LED on/off
+        self.create_subscription(String, '/arduino/rx', self.on_arduino, 10)    # button
 
-        self.get_logger().info(f'Ready. {len(SEQUENCE)} steps. Press the button to start.')
+        self.get_logger().info('Ready. Press the button to run pick and place.')
 
     def on_arduino(self, msg):
-        if msg.data != 'PRESS' or self.busy():
+        if msg.data != 'PRESS':
             return
-        self.tx_pub.publish(String(data='ON'))   # LED on: busy
-        self.run_step()
 
-    def busy(self):
-        return self.target is not None or getattr(self, 'grip_timer', None) is not None
+        self.tx_pub.publish(String(data='ON'))   # LED on: robot busy
+
+        if RUN_ALL:
+            # run every step, starting from wherever we are in the sequence
+            while True:
+                if not self.run_step():
+                    break                        # a step failed: stop
+                if self.step == 0:
+                    break                        # back at the start: sequence done
+        else:
+            self.run_step()                      # just one step per press
+
+        self.tx_pub.publish(String(data='OFF'))  # LED off: done (or stopped)
 
     def run_step(self):
-        kind, target = SEQUENCE[self.step]
-        self.get_logger().info(f'Step {self.step + 1}/{len(SEQUENCE)}: {kind} {target}')
+        """Run SEQUENCE[self.step]. Returns True if it went well."""
+        action, target = SEQUENCE[self.step]
+        self.get_logger().info(f'Step {self.step + 1}/{len(SEQUENCE)}: {action}')
 
-        if kind == 'movej':
-            self.script_pub.publish(String(
-                data=f'movej(p{target}, a={JOINT_ACCEL}, v={JOINT_SPEED})\n'))
-            self.target = target[:3]   # only x, y, z are checked
-        elif kind == 'movel':
-            self.script_pub.publish(String(
-                data=f'movel(p{target}, a={LIN_ACCEL}, v={LIN_SPEED})\n'))
-            self.target = target[:3]
-        elif kind == 'grip':
+        # moveL/moveJ_IK WAIT until the robot has arrived
+        if action == 'movej':
+            ok = self.robot.moveJ_IK(target, JOINT_SPEED, JOINT_ACCEL)
+        elif action == 'movel':
+            ok = self.robot.moveL(target, LIN_SPEED, LIN_ACCEL)
+        elif action == 'grip':
             # Later: send 'CLOSE'/'OPEN' to the Arduino and wait for it to answer.
             self.get_logger().info(f'(placeholder) gripper {target}')
-            self.grip_timer = self.create_timer(GRIP_TIME, self.on_grip_done)
+            time.sleep(1.0)
+            ok = True
 
-    def on_pose(self, msg):
-        if self.target is None:
-            return   # no move in progress
-        p = msg.pose.position
-        distance = math.dist((p.x, p.y, p.z), self.target)
-        if distance < TOLERANCE:
-            self.target = None
-            self.step_done()
+        if not ok:
+            self.get_logger().error(f'Step {self.step + 1} failed. Next press retries it.')
+            return False
 
-    def on_grip_done(self):
-        self.grip_timer.cancel()   # only fire once
-        self.grip_timer = None
-        self.step_done()
-
-    def step_done(self):
-        self.step = (self.step + 1) % len(SEQUENCE)
+        self.step = (self.step + 1) % len(SEQUENCE)   # go to the next step
         if self.step == 0:
-            self.get_logger().info('Sequence finished')
-            self.tx_pub.publish(String(data='OFF'))
-        elif RUN_ALL:
-            self.run_step()   # go straight on to the next step
-        else:
-            self.tx_pub.publish(String(data='OFF'))   # wait for the next press
+            self.get_logger().info('Pick and place finished')
+        return True
 
 
 def main():
@@ -130,6 +123,7 @@ def main():
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
+    node.robot.stopScript()   # release the robot
     node.destroy_node()
     rclpy.shutdown()
 
